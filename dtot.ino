@@ -31,7 +31,8 @@ Adafruit_VL53L0X sensorRight;
 
 /* ================= Web/State ================= */
 WebServer server(80);
-volatile bool autoReverse = false;
+
+volatile bool autoReverse = false;  // chế độ lùi tự động
 
 int dBack = -1, dLeft = -1, dRight = -1;      // mm
 int maxSpeed  = 200;   // duty 0..255
@@ -40,15 +41,22 @@ int accelStep = 10;
 String stateText = "Dừng";
 
 /* Ngưỡng có thể chỉnh qua MCP */
-int THRESH_BACK_MM = 70;   // dừng khi sau ≤ ngưỡng
+int THRESH_BACK_MM = 70;   // dừng (AUTO) khi sau ≤ ngưỡng
 int THRESH_SIDE_MM = 50;   // cảnh báo khi bên ≤ ngưỡng
 
-/* Side alert & nhấp nháy LED (không blocking) */
+/* ======= Headlight mode (ưu tiên đèn) ======= */
+enum HeadlightMode { HL_AUTO, HL_ON, HL_OFF, HL_BLINK };
+HeadlightMode headlightMode = HL_AUTO;
+
 bool sideAlert = false;
 bool ledBlinkState = false;
 unsigned long lastBlinkMs = 0;
 const uint32_t BLINK_INTERVAL_MS = 300;
-bool forceBlink = false;    // cho phép ra lệnh blink từ MCP khi không có cảnh báo
+
+/* ======= Manual mode: chạy mãi đến khi có lệnh khác ======= */
+enum ManualMode { MAN_NONE, MAN_FORWARD, MAN_BACKWARD };
+ManualMode manualMode = MAN_NONE;
+int manualDuty = 160;
 
 /* ================= PWM (LEDC) =================
    GIỮ NGUYÊN THEO CODE CŨ CỦA BẠN (không đổi sang ledcSetup/ledcAttachPin) */
@@ -60,11 +68,18 @@ void setupPWM() {
 
 /* ================= Motor helpers ================= */
 void motorBackward(int duty) {
-  if (duty < 0) duty = 0;
-  if (duty > 255) duty = 255;
+  duty = constrain(duty, 0, 255);
   digitalWrite(STBY, HIGH);
   digitalWrite(AIN1, LOW);   // chiều lùi
   digitalWrite(AIN2, HIGH);
+  ledcWriteChannel(0, duty);
+}
+
+void motorForward(int duty) {
+  duty = constrain(duty, 0, 255);
+  digitalWrite(STBY, HIGH);
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
   ledcWriteChannel(0, duty);
 }
 
@@ -75,19 +90,43 @@ void motorStop() {
   digitalWrite(STBY, LOW);
 }
 
-/* ================= LED update (ưu tiên) ================= */
+/* ================= LED update (tôn trọng ưu tiên) ================= */
 void updateLed() {
-  bool shouldBlink = sideAlert || forceBlink;
-  if (shouldBlink) {
-    unsigned long now = millis();
-    if (now - lastBlinkMs >= BLINK_INTERVAL_MS) {
-      lastBlinkMs = now;
-      ledBlinkState = !ledBlinkState;
-      digitalWrite(LED_PIN, ledBlinkState ? HIGH : LOW);
+  switch (headlightMode) {
+    case HL_ON:
+      digitalWrite(LED_PIN, HIGH);
+      ledBlinkState = false;
+      return;
+    case HL_OFF:
+      digitalWrite(LED_PIN, LOW);
+      ledBlinkState = false;
+      return;
+    case HL_BLINK: {
+      unsigned long now = millis();
+      if (now - lastBlinkMs >= BLINK_INTERVAL_MS) {
+        lastBlinkMs = now;
+        ledBlinkState = !ledBlinkState;
+        digitalWrite(LED_PIN, ledBlinkState ? HIGH : LOW);
+      }
+      return;
     }
-  } else {
-    digitalWrite(LED_PIN, autoReverse ? HIGH : LOW);
-    ledBlinkState = false;
+    case HL_AUTO:
+    default: {
+      // AUTO: ưu tiên cảnh báo bên -> nhấp nháy; nếu không thì theo autoReverse
+      if (sideAlert) {
+        unsigned long now = millis();
+        if (now - lastBlinkMs >= BLINK_INTERVAL_MS) {
+          lastBlinkMs = now;
+          ledBlinkState = !ledBlinkState;
+          digitalWrite(LED_PIN, ledBlinkState ? HIGH : LOW);
+        }
+      } else {
+        // LED bật khi autoReverse đang ON (manual không ảnh hưởng đèn AUTO)
+        digitalWrite(LED_PIN, autoReverse ? HIGH : LOW);
+        ledBlinkState = false;
+      }
+      return;
+    }
   }
 }
 
@@ -96,11 +135,23 @@ const char index_html[] PROGMEM = R"HTML(
 <!DOCTYPE html>
 <html lang="vi"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32 Auto Lùi + Voice (Xiaozhi)</title>
+<title>Điều khiển xe ô tô</title>
 <style>
   body{font-family:Arial,Helvetica,sans-serif;background:#0b0b0b;color:#eee;margin:0}
   h1{margin:0;padding:12px 16px;background:#0d6efd}
-  .box{background:#2d2d2d;border:1px solid #4b4b4b;border-radius:10px;display:inline-block;margin:18px;padding:16px;min-width:260px}
+  body {
+  text-align: center;
+}
+.box {
+  background: #2d2d2d;
+  border: 1px solid #4b4b4b;
+  border-radius: 10px;
+  display: inline-block;
+  margin: 18px;
+  padding: 16px;
+  min-width: 260px;
+}
+
   button{border:0;border-radius:8px;padding:10px 16px;font-size:16px;cursor:pointer}
   .on{background:#e74c3c;color:#fff}
   .off{background:#2ecc71;color:#000}
@@ -112,13 +163,11 @@ const char index_html[] PROGMEM = R"HTML(
 <body>
   <h1>🚗 ESP32 Auto Lùi + 🎤 Xiaozhi</h1>
   <div class="box">
-    <h3>📏 Cảm biến (mm)</h3>
+    <h3> Cảm biến </h3>
     Sau: <span id="dBack">-</span><br>
     Trái: <span id="dLeft">-</span><br>
     Phải: <span id="dRight">-</span><br><br>
     Trạng thái: <b id="state">Dừng</b><br>
-    <span id="alert" class="badge">Side alert: off</span><br>
-    <div class="note">Ngưỡng sau ≤ <span id="thb">70</span> mm dừng • Bên ≤ <span id="ths">50</span> mm nháy</div><br>
     <button id="btn" class="off" onclick="toggle()">Bật Auto Lùi</button>
   </div>
 
@@ -156,51 +205,34 @@ void handleRoot() {
 
 void handleToggle() {
   autoReverse = !autoReverse;
-  if (!autoReverse) { motorStop(); speedNow = 0; }
+  if (autoReverse) {
+    // Bật AUTO sẽ hủy manual mode để tránh xung đột
+    manualMode = MAN_NONE;
+    motorStop(); speedNow = 0;
+  } else {
+    motorStop(); speedNow = 0;
+  }
   server.send(200, "text/plain", "OK");
 }
 
-/* ====== LOGIC tại /sensor:
- * - Auto ON & sideAlert  => DỪNG + nhấp nháy LED
- * - Auto ON & back ≤ THRESH_BACK_MM => DỪNG
- * - Auto ON & an toàn => lùi + tăng tốc dần
- * - Auto OFF: chỉ nháy nếu sideAlert/forceBlink, không đụng motor
- */
+/* /sensor chỉ trả trạng thái (không điều khiển động cơ) */
 void handleSensor() {
-  String state = "Dừng";
-
-  if (autoReverse) {
-    if (sideAlert) {
-      motorStop(); speedNow = 0;
-      state = "Dừng (cảnh báo bên)";
-    } else if (dBack < 0 || dBack <= THRESH_BACK_MM) {
-      motorStop(); speedNow = 0;
-      state = (dBack < 0) ? "Dừng (mất đo sau)" : "Dừng (vật cản sau gần)";
-    } else {
-      if (speedNow < maxSpeed) {
-        speedNow += accelStep;
-        if (speedNow > maxSpeed) speedNow = maxSpeed;
-      }
-      motorBackward(speedNow);
-      state = "Lùi Auto";
-    }
-  } else {
-    state = (sideAlert || forceBlink) ? "Cảnh báo (LED nháy)" : "Dừng (Tắt Auto)";
-  }
-
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<360> doc;
   doc["dBack"] = dBack;
   doc["dLeft"] = dLeft;
   doc["dRight"] = dRight;
-  doc["state"] = state;
+  doc["state"] = stateText;
   doc["auto"] = autoReverse;
   doc["sideAlert"] = sideAlert;
   doc["th_back"] = THRESH_BACK_MM;
   doc["th_side"] = THRESH_SIDE_MM;
+  doc["hl_mode"] = (headlightMode==HL_AUTO?"auto":headlightMode==HL_ON?"on":headlightMode==HL_OFF?"off":"blink");
+  doc["manual"]  = (manualMode==MAN_FORWARD?"forward":manualMode==MAN_BACKWARD?"backward":"none");
+  doc["manualDuty"] = manualDuty;
 
-String payload;
-serializeJson(doc, payload);           // tạo String
-server.send(200, "application/json", payload);
+  String payload;
+  serializeJson(doc, payload);
+  server.send(200, "application/json", payload);
 }
 
 /* ================= Sensor init helpers ================= */
@@ -227,9 +259,9 @@ void registerMcpTools() {
     [](const String& args){
       DynamicJsonDocument doc(128); deserializeJson(doc, args);
       String st = doc["state"].as<String>();
-      if (st == "on")  autoReverse = true;
-      if (st == "off") { autoReverse = false; motorStop(); speedNow = 0; }
-      if (st == "toggle") autoReverse = !autoReverse;
+      if (st == "on")  { autoReverse = true;  manualMode = MAN_NONE; motorStop(); speedNow = 0; }
+      if (st == "off") { autoReverse = false; /* không đụng manual */ }
+      if (st == "toggle") { autoReverse = !autoReverse; if (autoReverse) { manualMode = MAN_NONE; motorStop(); speedNow = 0; } }
       return WebSocketMCP::ToolResponse(String("{\"auto\":") + (autoReverse?"true":"false") + "}");
     }
   );
@@ -237,18 +269,19 @@ void registerMcpTools() {
   // 2) Dừng khẩn cấp
   mcpClient.registerTool(
     "stop_now",
-    "Dừng motor ngay lập tức",
+    "Dừng motor ngay lập tức & hủy manual; AUTO vẫn giữ nguyên cờ",
     "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
     [](const String&){
       motorStop(); speedNow = 0;
+      manualMode = MAN_NONE;
       return WebSocketMCP::ToolResponse("{\"stopped\":true}");
     }
   );
 
-  // 3) Đặt tốc độ tối đa
+  // 3) Đặt tốc độ tối đa (cho AUTO)
   mcpClient.registerTool(
     "set_speed",
-    "Đặt tốc độ PWM tối đa (0..255)",
+    "Đặt tốc độ PWM tối đa (0..255) cho AUTO",
     "{\"type\":\"object\",\"properties\":{\"maxSpeed\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}},\"required\":[\"maxSpeed\"]}",
     [](const String& args){
       DynamicJsonDocument doc(128); deserializeJson(doc, args);
@@ -259,113 +292,115 @@ void registerMcpTools() {
     }
   );
 
-  // 4) Đặt ngưỡng dừng sau / cảnh báo bên
+  // 4) Đặt ngưỡng dừng sau / cảnh báo bên (tác dụng với AUTO + LED AUTO)
   mcpClient.registerTool(
     "set_thresholds",
     "Đặt ngưỡng sau (back_mm) và bên (side_mm) đơn vị mm",
     "{\"type\":\"object\",\"properties\":{\"back_mm\":{\"type\":\"integer\",\"minimum\":20,\"maximum\":2000},\"side_mm\":{\"type\":\"integer\",\"minimum\":20,\"maximum\":2000}},\"required\":[]}",
     [](const String& args){
       DynamicJsonDocument doc(128); deserializeJson(doc, args);
-      if (doc.containsKey("back_mm")) THRESH_BACK_MM = doc["back_mm"].as<int>();
-      if (doc.containsKey("side_mm")) THRESH_SIDE_MM = doc["side_mm"].as<int>();
-      THRESH_BACK_MM = constrain(THRESH_BACK_MM, 20, 2000);
-      THRESH_SIDE_MM = constrain(THRESH_SIDE_MM, 20, 2000);
+      if (doc.containsKey("back_mm")) THRESH_BACK_MM = constrain(doc["back_mm"].as<int>(), 20, 2000);
+      if (doc.containsKey("side_mm")) THRESH_SIDE_MM = constrain(doc["side_mm"].as<int>(), 20, 2000);
       return WebSocketMCP::ToolResponse(
         String("{\"back_mm\":") + THRESH_BACK_MM + ",\"side_mm\":" + THRESH_SIDE_MM + "}"
       );
     }
   );
 
-  // 5) Điều khiển LED: on/off/blink (không blocking)
+  // 5) Headlight: ON
   mcpClient.registerTool(
-    "led_blink",
-    "Điều khiển LED báo: on/off/blink (không dùng delay)",
-    "{\"type\":\"object\",\"properties\":{\"state\":{\"type\":\"string\",\"enum\":[\"on\",\"off\",\"blink\"]}},\"required\":[\"state\"]}",
-    [](const String& args){
-      DynamicJsonDocument doc(128); deserializeJson(doc, args);
-      String st = doc["state"].as<String>();
-      if (st == "on")  { forceBlink = false; digitalWrite(LED_PIN, HIGH); }
-      if (st == "off") { forceBlink = false; digitalWrite(LED_PIN, LOW);  }
-      if (st == "blink"){ forceBlink = true; } // updateLed() sẽ thực thi nháy
-      return WebSocketMCP::ToolResponse(String("{\"led\":\"") + st + "\"}");
+    "turn_on_headlight",
+    "Bật đèn xe (sáng liên tục, override AUTO)",
+    "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+    [](const String&){
+      headlightMode = HL_ON;
+      return WebSocketMCP::ToolResponse("{\"headlight\":\"on\"}");
     }
   );
 
-  // 6) Lấy trạng thái hiện tại (JSON)
+  // 6) Headlight: OFF
+  mcpClient.registerTool(
+    "turn_off_headlight",
+    "Tắt đèn xe (override AUTO)",
+    "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+    [](const String&){
+      headlightMode = HL_OFF;
+      return WebSocketMCP::ToolResponse("{\"headlight\":\"off\"}");
+    }
+  );
+
+  // 7) Headlight: BLINK
+  mcpClient.registerTool(
+    "led_blink",
+    "Đèn nhấp nháy (override AUTO)",
+    "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+    [](const String&){
+      headlightMode = HL_BLINK;
+      return WebSocketMCP::ToolResponse("{\"headlight\":\"blink\"}");
+    }
+  );
+
+  // 8) Headlight: AUTO
+  mcpClient.registerTool(
+    "headlight_auto",
+    "Đèn ở chế độ AUTO (theo sideAlert/autoReverse)",
+    "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+    [](const String&){
+      headlightMode = HL_AUTO;
+      return WebSocketMCP::ToolResponse("{\"headlight\":\"auto\"}");
+    }
+  );
+
+  // 9) Cho xe đi thẳng (manual) — CHẠY MÃI cho đến khi có lệnh khác
+  mcpClient.registerTool(
+    "manual_forward",
+    "Cho xe chạy tiến thủ công (chạy mãi đến khi lệnh khác)",
+    "{\"type\":\"object\",\"properties\":{\"speed\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}},\"required\":[]}",
+    [](const String& args){
+      DynamicJsonDocument doc(128);
+      deserializeJson(doc, args);
+      manualDuty = constrain((int)(doc["speed"] | 180), 0, 255);
+      autoReverse = false;      // tắt AUTO để manual toàn quyền
+      manualMode = MAN_FORWARD; // bật manual forward
+      stateText = "Đang tiến (manual)";
+      return WebSocketMCP::ToolResponse(String("{\"manual\":\"forward\",\"speed\":") + manualDuty + "}");
+    }
+  );
+
+  // 10) Cho xe chạy lùi (manual) — CHẠY MÃI cho đến khi có lệnh khác
+  mcpClient.registerTool(
+    "manual_backward",
+    "Cho xe chạy lùi thủ công (chạy mãi đến khi lệnh khác)",
+    "{\"type\":\"object\",\"properties\":{\"speed\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}},\"required\":[]}",
+    [](const String& args){
+      DynamicJsonDocument doc(128);
+      deserializeJson(doc, args);
+      manualDuty = constrain((int)(doc["speed"] | 180), 0, 255);
+      autoReverse = false;       // tắt AUTO để manual toàn quyền
+      manualMode = MAN_BACKWARD; // bật manual backward
+      stateText = "Đang lùi (manual)";
+      return WebSocketMCP::ToolResponse(String("{\"manual\":\"backward\",\"speed\":") + manualDuty + "}");
+    }
+  );
+
+  // 11) Lấy trạng thái hiện tại (JSON)
   mcpClient.registerTool(
     "get_status",
     "Trả về trạng thái cảm biến/motor/json",
     "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
     [](const String&){
-      DynamicJsonDocument doc(256);
+      DynamicJsonDocument doc(360);
       doc["dBack"]=dBack; doc["dLeft"]=dLeft; doc["dRight"]=dRight;
       doc["auto"]=autoReverse; doc["sideAlert"]=sideAlert;
       doc["speedNow"]=speedNow; doc["maxSpeed"]=maxSpeed;
       doc["th_back"]=THRESH_BACK_MM; doc["th_side"]=THRESH_SIDE_MM;
+      doc["hl_mode"]=(headlightMode==HL_AUTO?"auto":headlightMode==HL_ON?"on":headlightMode==HL_OFF?"off":"blink");
+      doc["manual"]=(manualMode==MAN_FORWARD?"forward":manualMode==MAN_BACKWARD?"backward":"none");
+      doc["manualDuty"]=manualDuty;
       String out; serializeJson(doc, out);
       return WebSocketMCP::ToolResponse(out);
     }
   );
-    // 7) Bật đèn xe
-  mcpClient.registerTool(
-    "turn_on_headlight",
-    "Bật đèn xe (LED_PIN sáng liên tục)",
-    "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
-    [](const String&){
-      forceBlink = false;
-      digitalWrite(LED_PIN, HIGH);
-      return WebSocketMCP::ToolResponse("{\"headlight\":\"on\"}");
-    }
-  );
-
-  // 8) Tắt đèn xe
-  mcpClient.registerTool(
-    "turn_off_headlight",
-    "Tắt đèn xe (LED_PIN tắt)",
-    "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
-    [](const String&){
-      forceBlink = false;
-      digitalWrite(LED_PIN, LOW);
-      return WebSocketMCP::ToolResponse("{\"headlight\":\"off\"}");
-    }
-  );
-
-  // 9) Cho xe đi thẳng (manual forward)
-  mcpClient.registerTool(
-    "manual_forward",
-    "Cho xe chạy tiến thủ công (AIN1=HIGH, AIN2=LOW)",
-    "{\"type\":\"object\",\"properties\":{\"speed\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}},\"required\":[]}",
-    [](const String& args){
-      DynamicJsonDocument doc(128);
-      deserializeJson(doc, args);
-      int duty = doc["speed"] | 180;
-      duty = constrain(duty, 0, 255);
-      digitalWrite(STBY, HIGH);
-      digitalWrite(AIN1, HIGH);
-      digitalWrite(AIN2, LOW);
-      ledcWriteChannel(0, duty);
-      return WebSocketMCP::ToolResponse(String("{\"forward_speed\":") + duty + "}");
-    }
-  );
-
-  // 10) Cho xe chạy lùi (manual backward)
-  mcpClient.registerTool(
-    "manual_backward",
-    "Cho xe chạy lùi thủ công (AIN1=LOW, AIN2=HIGH)",
-    "{\"type\":\"object\",\"properties\":{\"speed\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}},\"required\":[]}",
-    [](const String& args){
-      DynamicJsonDocument doc(128);
-      deserializeJson(doc, args);
-      int duty = doc["speed"] | 180;
-      duty = constrain(duty, 0, 255);
-      digitalWrite(STBY, HIGH);
-      digitalWrite(AIN1, LOW);
-      digitalWrite(AIN2, HIGH);
-      ledcWriteChannel(0, duty);
-      return WebSocketMCP::ToolResponse(String("{\"backward_speed\":") + duty + "}");
-    }
-  );
-
 
   Serial.println("[MCP] 🛠️ Đã đăng ký tool cho Xiaozhi");
 }
@@ -439,13 +474,48 @@ void loop() {
     sensorLeft.rangingTest(&m, false);  dLeft  = (m.RangeStatus != 4) ? m.RangeMilliMeter : -1;
     sensorRight.rangingTest(&m, false); dRight = (m.RangeStatus != 4) ? m.RangeMilliMeter : -1;
 
-    // Cập nhật cảnh báo bên
+    // Cập nhật cảnh báo bên (chỉ ảnh hưởng đèn HL_AUTO)
     sideAlert = ((dLeft >= 0 && dLeft <= THRESH_SIDE_MM) || (dRight >= 0 && dRight <= THRESH_SIDE_MM));
 
-    // Cập nhật LED theo ưu tiên (sideAlert hoặc forceBlink)
+    // ===== Ưu tiên điều khiển =====
+    if (manualMode == MAN_FORWARD) {
+      motorForward(manualDuty);
+      stateText = "Đang tiến (manual)";
+      // bỏ qua AUTO khi manual đang active
+    }
+    else if (manualMode == MAN_BACKWARD) {
+      motorBackward(manualDuty);
+      stateText = "Đang lùi (manual)";
+      // bỏ qua AUTO khi manual đang active (KHÔNG tự dừng khi gặp vật cản)
+    }
+    else if (autoReverse) {
+      // AUTO: dừng khi gần/sideAlert
+      if (sideAlert) {
+        motorStop(); speedNow = 0;
+        stateText = "Dừng (AUTO: cảnh báo bên)";
+      } else if (dBack < 0 || dBack <= THRESH_BACK_MM) {
+        motorStop(); speedNow = 0;
+        stateText = (dBack < 0) ? "Dừng (AUTO: mất đo sau)" : "Dừng (AUTO: vật cản sau gần)";
+      } else {
+        if (speedNow < maxSpeed) {
+          speedNow += accelStep;
+          if (speedNow > maxSpeed) speedNow = maxSpeed;
+        }
+        motorBackward(speedNow);
+        stateText = "Lùi Auto";
+      }
+    }
+    else {
+      // Không manual, không auto → dừng
+      motorStop();
+      stateText = sideAlert ? "Cảnh báo (LED nháy)" : "Dừng";
+    }
+
+    // Cập nhật đèn theo ưu tiên (headlightMode / sideAlert / autoReverse)
     updateLed();
 
-    Serial.printf("Back:%4d | Left:%4d | Right:%4d | Auto:%d | Speed:%3d | Alert:%d | TH(back:%d, side:%d)\n",
-                  dBack, dLeft, dRight, autoReverse, speedNow, sideAlert, THRESH_BACK_MM, THRESH_SIDE_MM);
+    Serial.printf("Back:%4d | Left:%4d | Right:%4d | Auto:%d | Manual:%d | Duty:%3d | Alert:%d | HL:%d | TH(back:%d, side:%d)\n",
+                  dBack, dLeft, dRight, autoReverse, (int)manualMode, manualDuty,
+                  sideAlert, (int)headlightMode, THRESH_BACK_MM, THRESH_SIDE_MM);
   }
 }
