@@ -35,7 +35,7 @@ WebServer server(80);
 volatile bool autoReverse = false;  // chế độ lùi tự động
 
 int dBack = -1, dLeft = -1, dRight = -1;      // mm
-int maxSpeed  = 200;   // duty 0..255
+int maxSpeed  = 180;   // duty 0..255
 int speedNow  = 0;
 int accelStep = 10;
 String stateText = "Dừng";
@@ -133,69 +133,53 @@ void updateLed() {
 /* ================= HTML ================= */
 const char index_html[] PROGMEM = R"HTML(
 <!DOCTYPE html>
-<html lang="vi"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Điều khiển xe ô tô</title>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 Auto Reverse</title>
 <style>
-  body{font-family:Arial,Helvetica,sans-serif;background:#0b0b0b;color:#eee;margin:0}
-  h1{margin:0;padding:12px 16px;background:#0d6efd}
-  body {
-  text-align: center;
-}
-.box {
-  background: #2d2d2d;
-  border: 1px solid #4b4b4b;
-  border-radius: 10px;
-  display: inline-block;
-  margin: 18px;
-  padding: 16px;
-  min-width: 260px;
-}
-
-  button{border:0;border-radius:8px;padding:10px 16px;font-size:16px;cursor:pointer}
-  .on{background:#e74c3c;color:#fff}
-  .off{background:#2ecc71;color:#000}
-  .badge{display:inline-block;padding:4px 8px;border-radius:8px;margin-top:6px;background:#444}
-  .alert{background:#ff9800;color:#000}
-  .note{opacity:.7;font-size:12px}
+body{font-family:Arial;text-align:center;background:#111;color:white;margin:0;padding:0;}
+h1{background:#007bff;color:white;padding:10px;margin:0;}
+.box{border:1px solid #555;padding:10px;margin:10px;border-radius:8px;background:#222;display:inline-block;}
+button{padding:10px 20px;font-size:16px;border:none;border-radius:5px;margin:5px;}
+.on{background:#ff4444;color:white;}
+.off{background:#44ff44;color:black;}
 </style>
 </head>
 <body>
-  <h1>🚗 ESP32 Auto Lùi + 🎤 Xiaozhi</h1>
-  <div class="box">
-    <h3> Cảm biến </h3>
-    Sau: <span id="dBack">-</span><br>
-    Trái: <span id="dLeft">-</span><br>
-    Phải: <span id="dRight">-</span><br><br>
-    Trạng thái: <b id="state">Dừng</b><br>
-    <button id="btn" class="off" onclick="toggle()">Bật Auto Lùi</button>
-  </div>
+<h1>🚗 ESP32 Auto Lùi Xe</h1>
+<div class="box">
+<h3>📏 Cảm biến (mm)</h3>
+Sau: <span id="dBack">-</span><br>
+Trái: <span id="dLeft">-</span><br>
+Phải: <span id="dRight">-</span><br><br>
+Trạng thái: <b id="state">Dừng</b><br><br>
+<button id="btn" class="off" onclick="toggle()">Bật Auto Lùi</button>
+</div>
 
 <script>
-async function poll(){
-  try{
-    const r = await fetch('/sensor',{cache:'no-store'});
-    if(!r.ok) throw new Error(r.status);
-    const j = await r.json();
-    dBack.textContent  = j.dBack;
-    dLeft.textContent  = j.dLeft;
-    dRight.textContent = j.dRight;
-    state.textContent  = j.state;
-    thb.textContent    = j.th_back;
-    ths.textContent    = j.th_side;
-    const btn=document.getElementById('btn');
-    if(j.auto){ btn.textContent='Tắt Auto Lùi'; btn.className='on'; }
-    else      { btn.textContent='Bật Auto Lùi'; btn.className='off'; }
-    const badge = document.getElementById('alert');
-    if(j.sideAlert){ badge.textContent='Side alert: ON'; badge.className='badge alert'; }
-    else           { badge.textContent='Side alert: off'; badge.className='badge'; }
-  }catch(e){}
+function poll(){
+  fetch('/sensor').then(r=>r.json()).then(j=>{
+    document.getElementById("dBack").innerText=j.dBack;
+    document.getElementById("dLeft").innerText=j.dLeft;
+    document.getElementById("dRight").innerText=j.dRight;
+    document.getElementById("state").innerText=j.state;
+    const btn=document.getElementById("btn");
+    if(j.auto){
+      btn.innerText="Tắt Auto Lùi";
+      btn.className="on";
+    }else{
+      btn.innerText="Bật Auto Lùi";
+      btn.className="off";
+    }
+  });
 }
-function toggle(){ fetch('/toggle').catch(()=>{}); }
-setInterval(poll,500);
-poll();
+function toggle(){ fetch('/toggle'); }
+setInterval(poll,300);
 </script>
-</body></html>
+</body>
+</html>
 )HTML";
 
 /* ================= Web handlers ================= */
