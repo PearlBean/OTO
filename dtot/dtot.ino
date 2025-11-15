@@ -5,6 +5,7 @@
 #include <Adafruit_VL53L0X.h>
 #include <ArduinoJson.h>
 #include <WebSocketMCP.h>
+#include <ESP32Servo.h>  // SERVO DOOR
 
 /* ================= WiFi ================= */
 const char* ssid = "P4";
@@ -18,7 +19,7 @@ Adafruit_VL53L0X sensorRight;
 /* XSHUT pins */
 #define XSHUT_BACK   19
 #define XSHUT_LEFT   18
-#define XSHUT_RIGHT   4
+#define XSHUT_RIGHT  4
 
 /* ================= TB6612 (kênh A) ================= */
 #define PWMA   32
@@ -27,7 +28,26 @@ Adafruit_VL53L0X sensorRight;
 #define STBY   27
 
 /* ================= LED trạng thái ================= */
-#define LED_PIN 5   // D5
+#define LED_PIN       5    // đèn chế độ / auto
+#define WARN_LED_PIN  15   // 🔴 đèn cảnh báo vật cản
+
+/* ================= SERVO CỬA XE ================= */
+Servo doorServo;
+#define SERVO_PIN 26          // Servo cửa gắn chân 26
+int doorClosedAngle = 0;      // góc ĐÓNG cửa
+int doorOpenAngle   = 90;     // góc MỞ cửa
+int doorCurrentAngle = 0;
+bool doorIsOpen = false;
+
+void setDoor(bool open) {
+  if (open) {
+    doorCurrentAngle = doorOpenAngle;
+  } else {
+    doorCurrentAngle = doorClosedAngle;
+  }
+  doorServo.write(doorCurrentAngle);
+  doorIsOpen = open;
+}
 
 /* ================= Web/State ================= */
 WebServer server(80);
@@ -59,7 +79,7 @@ ManualMode manualMode = MAN_NONE;
 int manualDuty = 160;
 
 /* ================= PWM (LEDC) =================
-   GIỮ NGUYÊN THEO CODE CŨ CỦA BẠN (không đổi sang ledcSetup/ledcAttachPin) */
+   GIỮ NGUYÊN THEO CODE CŨ (ledcAttachChannel/ledcWriteChannel) */
 void setupPWM() {
   // pin, freq, resolution, channel
   ledcAttachChannel(PWMA, 10000, 8, 0);
@@ -156,6 +176,10 @@ Trái: <span id="dLeft">-</span><br>
 Phải: <span id="dRight">-</span><br><br>
 Trạng thái: <b id="state">Dừng</b><br><br>
 <button id="btn" class="off" onclick="toggle()">Bật Auto Lùi</button>
+<hr>
+Cửa: <b id="doorState">Đóng</b> (<span id="doorAngle">0</span>°)<br><br>
+<button onclick="door('open')">Mở cửa</button>
+<button onclick="door('close')">Đóng cửa</button>
 </div>
 
 <script>
@@ -173,9 +197,15 @@ function poll(){
       btn.innerText="Bật Auto Lùi";
       btn.className="off";
     }
+    // cập nhật trạng thái cửa
+    document.getElementById("doorState").innerText = j.doorOpen ? "Mở" : "Đóng";
+    document.getElementById("doorAngle").innerText = j.doorAngle;
   });
 }
+
 function toggle(){ fetch('/toggle'); }
+function door(cmd){ fetch('/door?cmd='+cmd); }
+
 setInterval(poll,300);
 </script>
 </body>
@@ -199,9 +229,25 @@ void handleToggle() {
   server.send(200, "text/plain", "OK");
 }
 
+/* /door: MỞ / ĐÓNG cửa bằng servo */
+void handleDoor() {
+  String cmd = server.hasArg("cmd") ? server.arg("cmd") : "";
+  if (cmd == "open") {
+    setDoor(true);
+    Serial.println("[DOOR] Open");
+    server.send(200, "text/plain", "door_open");
+  } else if (cmd == "close") {
+    setDoor(false);
+    Serial.println("[DOOR] Close");
+    server.send(200, "text/plain", "door_close");
+  } else {
+    server.send(400, "text/plain", "invalid_cmd");
+  }
+}
+
 /* /sensor chỉ trả trạng thái (không điều khiển động cơ) */
 void handleSensor() {
-  StaticJsonDocument<360> doc;
+  StaticJsonDocument<400> doc;
   doc["dBack"] = dBack;
   doc["dLeft"] = dLeft;
   doc["dRight"] = dRight;
@@ -213,6 +259,15 @@ void handleSensor() {
   doc["hl_mode"] = (headlightMode==HL_AUTO?"auto":headlightMode==HL_ON?"on":headlightMode==HL_OFF?"off":"blink");
   doc["manual"]  = (manualMode==MAN_FORWARD?"forward":manualMode==MAN_BACKWARD?"backward":"none");
   doc["manualDuty"] = manualDuty;
+  doc["doorOpen"] = doorIsOpen;
+  doc["doorAngle"] = doorCurrentAngle;
+
+  // gửi thêm flag vật cản để debug
+  bool obstacleDetected =
+    (dBack  >= 0 && dBack  <= THRESH_BACK_MM) ||
+    (dLeft  >= 0 && dLeft  <= THRESH_SIDE_MM) ||
+    (dRight >= 0 && dRight <= THRESH_SIDE_MM);
+  doc["obstacle"] = obstacleDetected;
 
   String payload;
   serializeJson(doc, payload);
@@ -276,7 +331,7 @@ void registerMcpTools() {
     }
   );
 
-  // 4) Đặt ngưỡng dừng sau / cảnh báo bên (tác dụng với AUTO + LED AUTO)
+  // 4) Đặt ngưỡng dừng sau / cảnh báo bên
   mcpClient.registerTool(
     "set_thresholds",
     "Đặt ngưỡng sau (back_mm) và bên (side_mm) đơn vị mm",
@@ -335,7 +390,7 @@ void registerMcpTools() {
     }
   );
 
-  // 9) Cho xe đi thẳng (manual) — CHẠY MÃI cho đến khi có lệnh khác
+  // 9) Cho xe đi thẳng (manual)
   mcpClient.registerTool(
     "manual_forward",
     "Cho xe chạy tiến thủ công (chạy mãi đến khi lệnh khác)",
@@ -344,14 +399,14 @@ void registerMcpTools() {
       DynamicJsonDocument doc(128);
       deserializeJson(doc, args);
       manualDuty = constrain((int)(doc["speed"] | 180), 0, 255);
-      autoReverse = false;      // tắt AUTO để manual toàn quyền
-      manualMode = MAN_FORWARD; // bật manual forward
+      autoReverse = false;
+      manualMode = MAN_FORWARD;
       stateText = "Đang tiến (manual)";
       return WebSocketMCP::ToolResponse(String("{\"manual\":\"forward\",\"speed\":") + manualDuty + "}");
     }
   );
 
-  // 10) Cho xe chạy lùi (manual) — CHẠY MÃI cho đến khi có lệnh khác
+  // 10) Cho xe chạy lùi (manual)
   mcpClient.registerTool(
     "manual_backward",
     "Cho xe chạy lùi thủ công (chạy mãi đến khi lệnh khác)",
@@ -360,14 +415,14 @@ void registerMcpTools() {
       DynamicJsonDocument doc(128);
       deserializeJson(doc, args);
       manualDuty = constrain((int)(doc["speed"] | 180), 0, 255);
-      autoReverse = false;       // tắt AUTO để manual toàn quyền
-      manualMode = MAN_BACKWARD; // bật manual backward
+      autoReverse = false;
+      manualMode = MAN_BACKWARD;
       stateText = "Đang lùi (manual)";
       return WebSocketMCP::ToolResponse(String("{\"manual\":\"backward\",\"speed\":") + manualDuty + "}");
     }
   );
 
-  // 11) Lấy trạng thái hiện tại (JSON)
+  // 11) Lấy trạng thái hiện tại
   mcpClient.registerTool(
     "get_status",
     "Trả về trạng thái cảm biến/motor/json",
@@ -381,12 +436,57 @@ void registerMcpTools() {
       doc["hl_mode"]=(headlightMode==HL_AUTO?"auto":headlightMode==HL_ON?"on":headlightMode==HL_OFF?"off":"blink");
       doc["manual"]=(manualMode==MAN_FORWARD?"forward":manualMode==MAN_BACKWARD?"backward":"none");
       doc["manualDuty"]=manualDuty;
+      doc["doorOpen"]=doorIsOpen;
+      doc["doorAngle"]=doorCurrentAngle;
+
+      bool obstacleDetected =
+        (dBack  >= 0 && dBack  <= THRESH_BACK_MM) ||
+        (dLeft  >= 0 && dLeft  <= THRESH_SIDE_MM) ||
+        (dRight >= 0 && dRight <= THRESH_SIDE_MM);
+      doc["obstacle"] = obstacleDetected;
+
       String out; serializeJson(doc, out);
       return WebSocketMCP::ToolResponse(out);
     }
   );
 
-  Serial.println("[MCP] 🛠️ Đã đăng ký tool cho Xiaozhi");
+  // 12) Mở cửa
+  mcpClient.registerTool(
+    "open_car_door",
+    "Mở cửa xe bằng servo (góc mặc định 90°, có thể truyền angle)",
+    "{\"type\":\"object\",\"properties\":{\"angle\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":180}},\"required\":[]}",
+    [](const String& args){
+      DynamicJsonDocument doc(128);
+      deserializeJson(doc, args);
+      if (doc.containsKey("angle")) {
+        doorOpenAngle = constrain((int)doc["angle"], 0, 180);
+      }
+      setDoor(true);
+      return WebSocketMCP::ToolResponse(
+        String("{\"doorOpen\":true, \"angle\":") + doorCurrentAngle + "}"
+      );
+    }
+  );
+
+  // 13) Đóng cửa
+  mcpClient.registerTool(
+    "close_car_door",
+    "Đóng cửa xe bằng servo (góc mặc định 0°, có thể truyền angle)",
+    "{\"type\":\"object\",\"properties\":{\"angle\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":180}},\"required\":[]}",
+    [](const String& args){
+      DynamicJsonDocument doc(128);
+      deserializeJson(doc, args);
+      if (doc.containsKey("angle")) {
+        doorClosedAngle = constrain((int)doc["angle"], 0, 180);
+      }
+      setDoor(false);
+      return WebSocketMCP::ToolResponse(
+        String("{\"doorOpen\":false, \"angle\":") + doorCurrentAngle + "}"
+      );
+    }
+  );
+
+  Serial.println("[MCP] 🛠️ Đã đăng ký tool cho Xiaozhi (kèm servo cửa)");
 }
 
 void onConnectionStatus(bool connected) {
@@ -412,14 +512,20 @@ void setup() {
   pinMode(PWMA, OUTPUT);
   pinMode(STBY, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
+  pinMode(WARN_LED_PIN, OUTPUT);   // 🔴 đèn cảnh báo
   digitalWrite(LED_PIN, LOW);
+  digitalWrite(WARN_LED_PIN, LOW);
 
   setupPWM();
 
+  // SERVO cửa
+  doorServo.attach(SERVO_PIN, 500, 2400);
+  setDoor(false); // cửa đóng lúc khởi động
+
   // Khởi tạo cảm biến với địa chỉ khác nhau
   sensorsPowerDownAll();
-  digitalWrite(XSHUT_BACK, HIGH); delay(20); if (!sensorBack.begin(0x30)) Serial.println("❌ Sensor Back lỗi!");
-  digitalWrite(XSHUT_LEFT, HIGH); delay(20); if (!sensorLeft.begin(0x31)) Serial.println("❌ Sensor Left lỗi!");
+  digitalWrite(XSHUT_BACK, HIGH);  delay(20); if (!sensorBack.begin(0x30)) Serial.println("❌ Sensor Back lỗi!");
+  digitalWrite(XSHUT_LEFT, HIGH);  delay(20); if (!sensorLeft.begin(0x31)) Serial.println("❌ Sensor Left lỗi!");
   digitalWrite(XSHUT_RIGHT, HIGH); delay(20); if (!sensorRight.begin(0x32)) Serial.println("❌ Sensor Right lỗi!");
 
   // WiFi
@@ -434,6 +540,7 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/toggle", handleToggle);
   server.on("/sensor", handleSensor);
+  server.on("/door", handleDoor);   // <-- THÊM ROUTE ĐIỀU KHIỂN CỬA
   server.begin();
   Serial.println("🌍 Web server ready");
 
@@ -461,16 +568,23 @@ void loop() {
     // Cập nhật cảnh báo bên (chỉ ảnh hưởng đèn HL_AUTO)
     sideAlert = ((dLeft >= 0 && dLeft <= THRESH_SIDE_MM) || (dRight >= 0 && dRight <= THRESH_SIDE_MM));
 
-    // ===== Ưu tiên điều khiển =====
+    // ===== BẬT ĐÈN CẢNH BÁO VẬT CẢN (D15) =====
+    bool obstacleDetected =
+      (dBack  >= 0 && dBack  <= THRESH_BACK_MM) ||
+      (dLeft  >= 0 && dLeft  <= THRESH_SIDE_MM) ||
+      (dRight >= 0 && dRight <= THRESH_SIDE_MM);
+
+    digitalWrite(WARN_LED_PIN, obstacleDetected ? HIGH : LOW);
+
+    // ===== Ưu tiên điều khiển motor =====
     if (manualMode == MAN_FORWARD) {
       motorForward(manualDuty);
       stateText = "Đang tiến (manual)";
-      // bỏ qua AUTO khi manual đang active
     }
     else if (manualMode == MAN_BACKWARD) {
       motorBackward(manualDuty);
       stateText = "Đang lùi (manual)";
-      // bỏ qua AUTO khi manual đang active (KHÔNG tự dừng khi gặp vật cản)
+      // (manual không auto dừng khi gặp vật cản – đèn cảnh báo chỉ báo hiệu)
     }
     else if (autoReverse) {
       // AUTO: dừng khi gần/sideAlert
@@ -490,16 +604,17 @@ void loop() {
       }
     }
     else {
-      // Không manual, không auto → dừng
       motorStop();
       stateText = sideAlert ? "Cảnh báo (LED nháy)" : "Dừng";
     }
 
-    // Cập nhật đèn theo ưu tiên (headlightMode / sideAlert / autoReverse)
+    // Cập nhật đèn chế độ
     updateLed();
 
-    Serial.printf("Back:%4d | Left:%4d | Right:%4d | Auto:%d | Manual:%d | Duty:%3d | Alert:%d | HL:%d | TH(back:%d, side:%d)\n",
-                  dBack, dLeft, dRight, autoReverse, (int)manualMode, manualDuty,
-                  sideAlert, (int)headlightMode, THRESH_BACK_MM, THRESH_SIDE_MM);
+    Serial.printf("Back:%4d | Left:%4d | Right:%4d | Obstacle:%d | Auto:%d | Manual:%d | Duty:%3d | Alert:%d | HL:%d | TH(back:%d, side:%d) | Door:%s(%d°)\n",
+                  dBack, dLeft, dRight, obstacleDetected,
+                  autoReverse, (int)manualMode, manualDuty,
+                  sideAlert, (int)headlightMode, THRESH_BACK_MM, THRESH_SIDE_MM,
+                  doorIsOpen ? "OPEN" : "CLOSE", doorCurrentAngle);
   }
 }
